@@ -255,6 +255,9 @@ class CircuitTracker:
         # These heads might benefit from PASTA steering to refocus attention
         delta = failure_mean - success_mean  # (num_layers, num_heads)
         
+        # Handle NaN values (can occur with very small sample sizes)
+        delta = np.nan_to_num(delta, nan=0.0)
+        
         # Flatten and get top-K indices
         flat_delta = delta.flatten()
         top_k_indices = np.argsort(flat_delta)[-top_k:][::-1]  # Descending order
@@ -262,9 +265,9 @@ class CircuitTracker:
         # Convert flat indices to (layer, head) pairs
         selected_heads: list[tuple[int, int, float]] = []
         for flat_idx in top_k_indices:
-            layer_idx = flat_idx // self.num_heads
-            head_idx = flat_idx % self.num_heads
-            delta_value = flat_delta[flat_idx]
+            layer_idx = int(flat_idx // self.num_heads)  # Convert to Python int
+            head_idx = int(flat_idx % self.num_heads)    # Convert to Python int
+            delta_value = float(flat_delta[flat_idx])    # Convert to Python float
             
             # Only include heads with positive delta (more active during failures)
             if delta_value > 0:
@@ -272,14 +275,15 @@ class CircuitTracker:
         
         if not selected_heads:
             print("Warning: No heads with positive delta found. Using top heads by absolute value.")
-            top_k_indices = np.argsort(np.abs(flat_delta))[-top_k:][::-1]
+            abs_delta = np.abs(flat_delta)
+            top_k_indices = np.argsort(abs_delta)[-top_k:][::-1]
             for flat_idx in top_k_indices:
-                layer_idx = flat_idx // self.num_heads
-                head_idx = flat_idx % self.num_heads
-                delta_value = np.abs(flat_delta[flat_idx])
+                layer_idx = int(flat_idx // self.num_heads)  # Convert to Python int
+                head_idx = int(flat_idx % self.num_heads)    # Convert to Python int
+                delta_value = float(abs_delta[flat_idx])     # Convert to Python float
                 selected_heads.append((layer_idx, head_idx, delta_value))
         
-        # Build head_config dict: layer -> list of heads
+        # Build head_config dict: layer -> list of heads (ensure Python int types)
         head_config: dict[int, list[int]] = {}
         for layer_idx, head_idx, _ in selected_heads:
             if layer_idx not in head_config:
@@ -293,13 +297,14 @@ class CircuitTracker:
         
         # Compute alpha: proportional to normalized delta
         delta_values = np.array([d for _, _, d in selected_heads])
-        if delta_values.max() > 0:
+        max_delta = delta_values.max() if len(delta_values) > 0 else 0
+        if max_delta > 0:
             # Normalize to [0, 1] range, then scale
-            normalized_delta = delta_values / delta_values.max()
-            mean_normalized = normalized_delta.mean()
+            normalized_delta = delta_values / max_delta
+            mean_normalized = float(normalized_delta.mean())
             alpha = float(np.clip(alpha_scale * (1 + mean_normalized), alpha_min, alpha_max))
         else:
-            alpha = alpha_scale
+            alpha = float(alpha_scale)
         
         # Print analysis summary
         print(f"\n=== Circuit Analysis Summary ===")
