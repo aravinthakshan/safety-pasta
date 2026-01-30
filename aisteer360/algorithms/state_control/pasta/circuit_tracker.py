@@ -285,8 +285,7 @@ class CircuitTracker:
             if layer_idx not in head_config:
                 head_config[layer_idx] = []
             if head_idx not in head_config[layer_idx]:
-                head_config[layer_idx][head_idx] = head_idx
-                head_config[layer_idx] = list(set(head_config[layer_idx]) | {head_idx})
+                head_config[layer_idx].append(head_idx)
         
         # Sort heads within each layer
         for layer_idx in head_config:
