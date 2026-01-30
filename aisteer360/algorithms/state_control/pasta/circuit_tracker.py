@@ -434,7 +434,7 @@ def create_circuit_pasta(
 
 def run_circuit_pasta_evaluation(
     model_name: str = "Qwen/Qwen2.5-1.5B-Instruct",
-    num_samples: int = 50,
+    num_samples: int = 5,
     top_k: int = 10,
     alpha_scale: float = 0.05,
     batch_size: int = 8,
@@ -467,6 +467,7 @@ def run_circuit_pasta_evaluation(
     import time
     from pathlib import Path
     
+    import nltk
     from datasets import load_dataset
     from transformers import AutoModelForCausalLM, AutoTokenizer, logging
     
@@ -477,6 +478,13 @@ def run_circuit_pasta_evaluation(
     from aisteer360.evaluation.benchmark import Benchmark
     
     logging.set_verbosity_error()
+    
+    # Download required NLTK data
+    print("Downloading required NLTK data...")
+    nltk.download('punkt_tab', quiet=True)
+    nltk.download('punkt', quiet=True)
+    nltk.download('averaged_perceptron_tagger', quiet=True)
+    print("NLTK data ready.")
     
     def log_time(start_time, step_name):
         elapsed = time.time() - start_time
@@ -743,7 +751,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num-samples", "-n",
         type=int,
-        default=50,
+        default=5,
         help="Number of evaluation samples",
     )
     parser.add_argument(
