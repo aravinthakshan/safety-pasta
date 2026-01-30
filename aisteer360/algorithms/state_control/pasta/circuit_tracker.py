@@ -1,5 +1,5 @@
 """
-gCircuit Tracker for Data-Driven PASTA Configuration using TransformerLens.
+Circuit Tracker for Data-Driven PASTA Configuration using TransformerLens.
 
 This module provides utilities to automatically learn optimal PASTA steering configurations
 by analyzing attention circuits using causal intervention methods.
