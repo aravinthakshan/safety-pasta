@@ -55,6 +55,10 @@ class PASTA(StateControl):
     Args = PASTAArgs
 
     supports_batching: bool = True
+    
+    # Debug flag - set to True to see PASTA in action
+    DEBUG: bool = True
+    _debug_hook_count: int = 0
 
     # placeholders
     model: PreTrainedModel | None = None
@@ -86,6 +90,15 @@ class PASTA(StateControl):
         self.tokenizer = tokenizer or getattr(model, "tokenizer", None)
         self.device = next(model.parameters()).device
         self._setup_head_config(self.head_config)
+        
+        if self.DEBUG:
+            print(f"\n[PASTA DEBUG] steer() called")
+            print(f"  alpha: {self.alpha}")
+            print(f"  scale_position: {self.scale_position}")
+            print(f"  head_config: {self.head_config}")
+            print(f"  layers: {self._layers}")
+            print(f"  head_map: {self._head_map}")
+        
         return model
 
     def get_hooks(
@@ -183,6 +196,17 @@ class PASTA(StateControl):
                     ),
                 }
             )
+
+        if self.DEBUG:
+            self._debug_hook_count += 1
+            if self._debug_hook_count <= 3:  # Only print first 3 times
+                print(f"\n[PASTA DEBUG] get_hooks() called (call #{self._debug_hook_count})")
+                print(f"  batch_size: {batch_size}")
+                print(f"  input_len: {input_len}")
+                print(f"  substrings received: {substrings[:2]}...")  # First 2 examples
+                print(f"  token_ranges: {[tr.tolist() for tr in token_ranges[:2]]}...")
+                print(f"  num_hooks created: {len(hooks['pre'])} (for layers {self._layers})")
+                print(f"  scale_constant (log alpha): {self._scale_constant.item():.4f}")
 
         return hooks
 
@@ -358,10 +382,14 @@ class PASTA(StateControl):
             ).contiguous()
 
         batch_size = attention_mask.size(0)
+        modifications_made = 0
         for batch_index in range(batch_size):
             for start_idx, end_idx in token_ranges[batch_index].tolist():
                 if start_idx == end_idx:
+                    if self.DEBUG and self._debug_hook_count <= 3:
+                        print(f"    [PASTA DEBUG] Skipping empty range for batch {batch_index}")
                     continue
+                modifications_made += 1
                 if self.scale_position == "include":
                     attention_mask[
                         batch_index, head_idx, :, start_idx:end_idx
@@ -383,6 +411,9 @@ class PASTA(StateControl):
 
         if self.scale_position == "include":
             attention_mask[:, head_idx, :, :input_len] -= self._scale_constant
+
+        if self.DEBUG and self._debug_hook_count <= 3 and modifications_made > 0:
+            print(f"    [PASTA DEBUG] _attention_pre_hook: modified {modifications_made} ranges, heads={head_idx}")
 
         input_kwargs["attention_mask"] = attention_mask
         return input_args, input_kwargs

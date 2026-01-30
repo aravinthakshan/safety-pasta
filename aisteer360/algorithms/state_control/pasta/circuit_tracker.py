@@ -545,7 +545,7 @@ def run_circuit_pasta_evaluation(
     model_name: str = "Qwen/Qwen2.5-1.5B-Instruct",
     num_samples: int = 50,
     top_k: int = 10,
-    alpha_scale: float = 0.05,
+    alpha_scale: float = 0.5,  # Increased from 0.05 for stronger effect
     batch_size: int = 8,
     max_new_tokens: int = 1024,
     save_dir: str = "./circuit_pasta_results",
@@ -697,7 +697,7 @@ def run_circuit_pasta_evaluation(
     
     manual_pasta = PASTA(
         head_config=[8, 9],
-        alpha=0.01,
+        alpha=0.5,  # Increased from 0.01
         scale_position="exclude",
     )
     
@@ -794,7 +794,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", "-m", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
     parser.add_argument("--num-samples", "-n", type=int, default=50)
     parser.add_argument("--top-k", "-k", type=int, default=10)
-    parser.add_argument("--alpha-scale", "-a", type=float, default=0.05)
+    parser.add_argument("--alpha-scale", "-a", type=float, default=0.5)
     parser.add_argument("--batch-size", "-b", type=int, default=8)
     parser.add_argument("--max-new-tokens", type=int, default=1024)
     parser.add_argument("--save-dir", "-o", type=str, default="./circuit_pasta_results")
