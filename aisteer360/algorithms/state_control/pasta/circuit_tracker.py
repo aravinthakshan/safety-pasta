@@ -104,8 +104,10 @@ class CircuitTracker:
                 formatted_prompts.append(formatted)
             prompts = formatted_prompts
         
-        for i in range(0, len(prompts), batch_size):
+        total_batches = (len(prompts) + batch_size - 1) // batch_size
+        for batch_idx, i in enumerate(range(0, len(prompts), batch_size)):
             batch_prompts = prompts[i:i + batch_size]
+            print(f"    Batch {batch_idx + 1}/{total_batches}: processing {len(batch_prompts)} prompts...")
             
             # Tokenize batch
             inputs = self.tokenizer(
@@ -462,6 +464,7 @@ def run_circuit_pasta_evaluation(
     """
     import gc
     import json
+    import time
     from pathlib import Path
     
     from datasets import load_dataset
@@ -475,6 +478,13 @@ def run_circuit_pasta_evaluation(
     
     logging.set_verbosity_error()
     
+    def log_time(start_time, step_name):
+        elapsed = time.time() - start_time
+        print(f"  ⏱️  {step_name} took {elapsed:.1f}s")
+        return time.time()
+    
+    total_start = time.time()
+    
     print("=" * 60)
     print("CIRCUIT-INFORMED PASTA EVALUATION")
     print("=" * 60)
@@ -487,16 +497,19 @@ def run_circuit_pasta_evaluation(
     # -------------------------------------------------------------------------
     # Step 1: Load dataset
     # -------------------------------------------------------------------------
+    step_start = time.time()
     print("\n[1/6] Loading Split-IFEval dataset...")
     dataset = load_dataset("ibm-research/Split-IFEval", split="train")
     evaluation_data = dataset.to_list()[:num_samples]
     prompts = [d["prompt"] for d in evaluation_data]
-    print(f"Loaded {len(evaluation_data)} examples")
+    print(f"  Loaded {len(evaluation_data)} examples")
+    step_start = log_time(step_start, "Dataset loading")
     
     # -------------------------------------------------------------------------
     # Step 2: Create use case and run baseline
     # -------------------------------------------------------------------------
     print("\n[2/6] Running baseline evaluation...")
+    print("  Setting up InstructionFollowing use case...")
     instruction_following = InstructionFollowing(
         evaluation_data=evaluation_data,
         evaluation_metrics=[StrictInstruction()],
@@ -515,6 +528,7 @@ def run_circuit_pasta_evaluation(
     tokenizer.padding_side = "left"
     
     # Run baseline benchmark
+    print("  Creating baseline benchmark...")
     baseline_benchmark = Benchmark(
         use_case=instruction_following,
         base_model_name_or_path=model_name,
@@ -529,7 +543,11 @@ def run_circuit_pasta_evaluation(
         },
         batch_size=batch_size,
     )
+    print("  Starting baseline generation (this may take a while)...")
+    print(f"  Processing {num_samples} samples with batch_size={batch_size}")
     baseline_profiles = baseline_benchmark.run()
+    print("  ✓ Baseline generation complete!")
+    step_start = log_time(step_start, "Baseline evaluation")
     
     # Extract success/failure mask
     baseline_results = baseline_profiles["baseline"][0]["evaluations"]["StrictInstruction"]
@@ -543,19 +561,24 @@ def run_circuit_pasta_evaluation(
     # Step 3: Capture attention patterns
     # -------------------------------------------------------------------------
     print("\n[3/6] Capturing attention patterns...")
+    print(f"  Model has {baseline_benchmark._base_model.config.num_hidden_layers} layers, {baseline_benchmark._base_model.config.num_attention_heads} heads")
     
     # Use the loaded model from benchmark
     tracker = CircuitTracker(
         model=baseline_benchmark._base_model,
         tokenizer=baseline_benchmark._base_tokenizer,
     )
+    print(f"  Processing {len(prompts)} prompts in batches of {batch_size}...")
     tracker.capture_batch(prompts, batch_size=batch_size)
-    print(f"Captured attention patterns for {len(prompts)} prompts")
+    print(f"  ✓ Captured attention patterns for {len(prompts)} prompts")
+    step_start = log_time(step_start, "Attention capture")
     
     # -------------------------------------------------------------------------
     # Step 4: Analyze circuits
     # -------------------------------------------------------------------------
     print("\n[4/6] Analyzing circuits...")
+    print(f"  Computing contrastive statistics between success/failure groups...")
+    print(f"  Selecting top-{top_k} heads with highest failure-success delta...")
     head_config, alpha = tracker.analyze(
         success_mask=follow_all_instructions,
         top_k=top_k,
@@ -594,6 +617,11 @@ def run_circuit_pasta_evaluation(
     )
     
     # Run comparison benchmark
+    print("  Creating comparison benchmark with 3 pipelines...")
+    print("    - baseline (no steering)")
+    print("    - manual_pasta (layers 8,9, alpha=0.01)")
+    print(f"    - circuit_pasta (learned config, alpha={alpha:.4f})")
+    
     comparison_benchmark = Benchmark(
         use_case=instruction_following_2,
         base_model_name_or_path=model_name,
@@ -617,7 +645,10 @@ def run_circuit_pasta_evaluation(
         batch_size=batch_size,
     )
     
+    print("  Starting comparison benchmark (3 runs, may take a while)...")
     comparison_profiles = comparison_benchmark.run()
+    print("  ✓ Comparison benchmark complete!")
+    step_start = log_time(step_start, "Comparison benchmark")
     
     # -------------------------------------------------------------------------
     # Step 6: Report results
@@ -682,6 +713,10 @@ def run_circuit_pasta_evaluation(
         json.dump(results, f, indent=2)
     
     print(f"\nResults saved to: {save_path / 'circuit_pasta_results.json'}")
+    
+    # Total time
+    total_elapsed = time.time() - total_start
+    print(f"\n🎉 Total evaluation time: {total_elapsed/60:.1f} minutes ({total_elapsed:.0f}s)")
     
     # Cleanup
     del tracker, model, baseline_benchmark, comparison_benchmark
