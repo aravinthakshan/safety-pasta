@@ -438,7 +438,7 @@ def create_circuit_pasta(
 
 def run_circuit_pasta_evaluation(
     model_name: str = "Qwen/Qwen2.5-1.5B-Instruct",
-    num_samples: int = 5,
+    num_samples: int = 50,
     top_k: int = 10,
     alpha_scale: float = 0.05,
     batch_size: int = 8,
@@ -755,7 +755,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num-samples", "-n",
         type=int,
-        default=5,
+        default=50,
         help="Number of evaluation samples",
     )
     parser.add_argument(
