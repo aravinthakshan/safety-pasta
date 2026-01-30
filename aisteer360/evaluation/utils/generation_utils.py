@@ -67,9 +67,12 @@ def chat_generate_model(
 
     prompts = apply_chat_template(tokenizer, batch)
     decoded_outputs = []
+    total_batches = (len(prompts) + batch_size - 1) // batch_size
+    print(f"      [generate_model] Starting generation: {len(prompts)} prompts, {total_batches} batches", flush=True)
 
-    for i in range(0, len(prompts), batch_size):
+    for batch_idx, i in enumerate(range(0, len(prompts), batch_size)):
         batch_prompts = prompts[i:i + batch_size]
+        print(f"      [generate_model] Batch {batch_idx + 1}/{total_batches} ({len(batch_prompts)} prompts)...", flush=True)
 
         try:
             inputs = tokenizer(
@@ -146,10 +149,14 @@ def chat_generate_pipeline(
     decoded_outputs: list[str] = []
 
     pipeline_supports_batching: bool = getattr(pipeline, "supports_batching", False)
+    total_batches = (len(prompts) + batch_size - 1) // batch_size
+    print(f"      [generate_pipeline] Starting generation: {len(prompts)} prompts, {total_batches} batches", flush=True)
+    print(f"      [generate_pipeline] Batching supported: {pipeline_supports_batching}", flush=True)
 
-    for i in range(0, len(prompts), batch_size):
+    for batch_idx, i in enumerate(range(0, len(prompts), batch_size)):
         batch_prompts = prompts[i: i + batch_size]
         current_batch_size = len(batch_prompts)
+        print(f"      [generate_pipeline] Batch {batch_idx + 1}/{total_batches} ({current_batch_size} prompts)...", flush=True)
 
         inputs = tokenizer(
             batch_prompts, padding=True, truncation=True, return_tensors="pt"

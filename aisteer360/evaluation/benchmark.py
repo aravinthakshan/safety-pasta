@@ -66,15 +66,19 @@ class Benchmark:
     def _ensure_base_model(self) -> None:
         """Load the base model/tokenizer once (for reuse across pipelines)."""
         if self._base_model is not None and self._base_tokenizer is not None:
+            print("    [benchmark] Using cached base model", flush=True)
             return
 
+        print(f"    [benchmark] Loading base model: {self.base_model_name_or_path}...", flush=True)
         self._base_model = AutoModelForCausalLM.from_pretrained(
             self.base_model_name_or_path,
             device_map=self.device_map,
             **self.hf_model_kwargs,
         )
+        print(f"    [benchmark] Loading tokenizer...", flush=True)
         self._base_tokenizer = AutoTokenizer.from_pretrained(self.base_model_name_or_path)
         self._base_tokenizer = ensure_pad_token(self._base_tokenizer)
+        print(f"    [benchmark] Model loaded successfully", flush=True)
 
     @staticmethod
     def _has_structural_control(controls: Sequence[Any]) -> bool:
@@ -151,7 +155,9 @@ class Benchmark:
 
             # build model or pipeline once
             if controls:
+                print(f"    [benchmark] Setting up pipeline with {len(controls)} control(s)...", flush=True)
                 if self._has_structural_control(controls):
+                    print(f"    [benchmark] Structural control detected, loading fresh model...", flush=True)
                     # SteeringPipeline loads from the base checkpoint
                     pipeline = SteeringPipeline(
                         model_name_or_path=self.base_model_name_or_path,
@@ -160,10 +166,13 @@ class Benchmark:
                         hf_model_kwargs=self.hf_model_kwargs,
                     )
 
+                    print(f"    [benchmark] Applying steering...", flush=True)
                     pipeline.steer()
                     tokenizer = pipeline.tokenizer
                     model_or_pipeline: Any = pipeline
+                    print(f"    [benchmark] Steering applied successfully", flush=True)
                 else:
+                    print(f"    [benchmark] Non-structural control, reusing base model...", flush=True)
                     # model not reloaded for non-structural controls (input/state/output only)
                     pipeline = SteeringPipeline(
                         model_name_or_path=None,
@@ -180,16 +189,20 @@ class Benchmark:
                     if self._base_model is not None:
                         pipeline.device = self._base_model.device
 
+                    print(f"    [benchmark] Applying steering...", flush=True)
                     pipeline.steer()
                     tokenizer = pipeline.tokenizer
                     model_or_pipeline = pipeline
+                    print(f"    [benchmark] Steering applied successfully", flush=True)
             else:
                 # baseline; use the shared base model directly
+                print(f"    [benchmark] Baseline mode (no steering)", flush=True)
                 model_or_pipeline = self._base_model
                 tokenizer = self._base_tokenizer
 
             # run trials
             for trial_id in range(self.num_trials):
+                print(f"    [benchmark] Trial {trial_id + 1}/{self.num_trials}: Starting generation...", flush=True)
                 generations = self.use_case.generate(
                     model_or_pipeline=model_or_pipeline,
                     tokenizer=tokenizer,
@@ -197,7 +210,9 @@ class Benchmark:
                     runtime_overrides=self.runtime_overrides,
                     batch_size=self.batch_size
                 )
+                print(f"    [benchmark] Trial {trial_id + 1}/{self.num_trials}: Generation complete, evaluating...", flush=True)
                 scores = self.use_case.evaluate(generations)
+                print(f"    [benchmark] Trial {trial_id + 1}/{self.num_trials}: Evaluation complete", flush=True)
 
                 runs.append(
                     {

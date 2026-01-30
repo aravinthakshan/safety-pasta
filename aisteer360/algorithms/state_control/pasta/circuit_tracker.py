@@ -480,7 +480,7 @@ def run_circuit_pasta_evaluation(
     
     def log_time(start_time, step_name):
         elapsed = time.time() - start_time
-        print(f"  ⏱️  {step_name} took {elapsed:.1f}s")
+        print(f"  [time] {step_name} took {elapsed:.1f}s")
         return time.time()
     
     total_start = time.time()
@@ -546,7 +546,7 @@ def run_circuit_pasta_evaluation(
     print("  Starting baseline generation (this may take a while)...")
     print(f"  Processing {num_samples} samples with batch_size={batch_size}")
     baseline_profiles = baseline_benchmark.run()
-    print("  ✓ Baseline generation complete!")
+    print("  [done] Baseline generation complete!")
     step_start = log_time(step_start, "Baseline evaluation")
     
     # Extract success/failure mask
@@ -570,7 +570,7 @@ def run_circuit_pasta_evaluation(
     )
     print(f"  Processing {len(prompts)} prompts in batches of {batch_size}...")
     tracker.capture_batch(prompts, batch_size=batch_size)
-    print(f"  ✓ Captured attention patterns for {len(prompts)} prompts")
+    print(f"  [done] Captured attention patterns for {len(prompts)} prompts")
     step_start = log_time(step_start, "Attention capture")
     
     # -------------------------------------------------------------------------
@@ -647,7 +647,7 @@ def run_circuit_pasta_evaluation(
     
     print("  Starting comparison benchmark (3 runs, may take a while)...")
     comparison_profiles = comparison_benchmark.run()
-    print("  ✓ Comparison benchmark complete!")
+    print("  [done] Comparison benchmark complete!")
     step_start = log_time(step_start, "Comparison benchmark")
     
     # -------------------------------------------------------------------------
@@ -716,7 +716,7 @@ def run_circuit_pasta_evaluation(
     
     # Total time
     total_elapsed = time.time() - total_start
-    print(f"\n🎉 Total evaluation time: {total_elapsed/60:.1f} minutes ({total_elapsed:.0f}s)")
+    print(f"\n[COMPLETE] Total evaluation time: {total_elapsed/60:.1f} minutes ({total_elapsed:.0f}s)")
     
     # Cleanup
     del tracker, model, baseline_benchmark, comparison_benchmark
