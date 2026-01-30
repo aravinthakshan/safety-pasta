@@ -1,427 +1,535 @@
 """
-Circuit Tracker for Data-Driven PASTA Configuration.
+gCircuit Tracker for Data-Driven PASTA Configuration using TransformerLens.
 
 This module provides utilities to automatically learn optimal PASTA steering configurations
-by analyzing attention patterns correlated with instruction-following failures.
+by analyzing attention circuits using causal intervention methods.
 
-The approach uses contrastive attention statistics (NOT full causal patching):
-1. Capture attention patterns during forward passes on prompts
-2. Separate examples into instruction-success vs instruction-failure groups
-3. Compute per-(layer, head) statistics: mean attention entropy or norm
-4. Compute delta scores: Δ = failure_mean − success_mean
-5. Select top-K heads with highest positive Δ as "instruction-failure circuits"
-6. Construct PASTA config with head_config and alpha proportional to normalized Δ
+The approach uses TransformerLens for proper mechanistic interpretability:
+1. Load model as HookedTransformer for activation access
+2. Run activation patching to identify causal attention heads
+3. Use attention knockout to measure head importance
+4. Select heads that causally affect instruction-following
+5. Construct PASTA config with head_config and alpha
 
 Reference:
-- Inspired by circuit analysis techniques from mechanistic interpretability
-- Uses contrastive statistics rather than activation patching for efficiency
+- TransformerLens: https://github.com/neelnanda-io/TransformerLens
+- Inspired by "Locating and Editing Factual Associations in GPT" (Meng et al.)
+- Causal tracing methodology from mechanistic interpretability research
 """
 
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Sequence, Callable
+from functools import partial
 
 import torch
 import numpy as np
-from transformers import PreTrainedModel, PreTrainedTokenizerBase
+
+# TransformerLens imports
+try:
+    from transformer_lens import HookedTransformer, ActivationCache
+    from transformer_lens.hook_points import HookPoint
+    TRANSFORMER_LENS_AVAILABLE = True
+except ImportError:
+    TRANSFORMER_LENS_AVAILABLE = False
+    HookedTransformer = None
+    ActivationCache = None
+    HookPoint = None
 
 
 class CircuitTracker:
-    """Tracks attention circuits correlated with instruction-following failures.
+    """Tracks attention circuits using TransformerLens causal interventions.
     
-    This class captures attention patterns during forward passes and identifies
-    attention heads that are differentially active during instruction-following
-    failures vs successes. These heads can then be used to configure PASTA
-    for improved instruction following.
+    This class uses activation patching and attention knockout to identify
+    attention heads that are causally responsible for instruction-following
+    behavior. These heads can then be used to configure PASTA.
     
     Args:
-        model: HuggingFace causal language model with attention output support.
-        tokenizer: Tokenizer for the model.
-        device: Device to run computations on. Defaults to model's device.
+        model_name: HuggingFace model name to load via TransformerLens.
+        device: Device to run computations on.
         
     Example:
-        >>> tracker = CircuitTracker(model, tokenizer)
-        >>> tracker.capture_batch(prompts)
-        >>> head_config, alpha = tracker.analyze(success_mask, top_k=10)
+        >>> tracker = CircuitTracker("Qwen/Qwen2.5-1.5B-Instruct")
+        >>> head_scores = tracker.run_activation_patching(clean_prompts, corrupted_prompts)
+        >>> head_config, alpha = tracker.get_top_heads(head_scores, top_k=10)
         >>> pasta = PASTA(head_config=head_config, alpha=alpha)
     """
     
     def __init__(
         self,
-        model: PreTrainedModel,
-        tokenizer: PreTrainedTokenizerBase,
-        device: torch.device | str | None = None,
+        model_name: str,
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        dtype: torch.dtype = torch.float16,
     ):
-        self.model = model
-        self.tokenizer = tokenizer
-        self.device = device or next(model.parameters()).device
+        if not TRANSFORMER_LENS_AVAILABLE:
+            raise ImportError(
+                "TransformerLens is required for causal circuit analysis. "
+                "Install with: pip install transformer_lens"
+            )
         
-        # Model architecture info
-        self.num_layers = model.config.num_hidden_layers
-        self.num_heads = model.config.num_attention_heads
-        
-        # Storage for attention statistics per example
-        # Shape after capture: (num_examples, num_layers, num_heads)
-        self.attention_entropy: list[np.ndarray] = []
-        self.attention_norm: list[np.ndarray] = []
-        
-        # Ensure tokenizer has padding configured
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-        if self.tokenizer.padding_side != "left":
-            self.tokenizer.padding_side = "left"
-    
-    def capture_batch(
-        self,
-        prompts: Sequence[str],
-        batch_size: int = 8,
-        max_length: int = 2048,
-        use_chat_template: bool = True,
-    ) -> None:
-        """Capture attention patterns for a batch of prompts.
-        
-        Runs forward passes on each prompt and stores per-(layer, head) attention
-        statistics (entropy and L2 norm) for later analysis.
-        
-        Args:
-            prompts: List of prompt strings to analyze.
-            batch_size: Number of prompts to process at once.
-            max_length: Maximum sequence length for tokenization.
-            use_chat_template: Whether to apply chat template to prompts.
-        """
+        print(f"Loading model {model_name} with TransformerLens...")
+        self.model = HookedTransformer.from_pretrained(
+            model_name,
+            device=device,
+            dtype=dtype,
+        )
         self.model.eval()
         
-        # Apply chat template if available and requested
-        if use_chat_template and hasattr(self.tokenizer, "apply_chat_template"):
-            formatted_prompts = []
-            for prompt in prompts:
-                messages = [{"role": "user", "content": prompt}]
-                formatted = self.tokenizer.apply_chat_template(
-                    messages,
-                    add_generation_prompt=True,
-                    tokenize=False,
-                )
-                formatted_prompts.append(formatted)
-            prompts = formatted_prompts
+        self.device = device
+        self.model_name = model_name
+        self.num_layers = self.model.cfg.n_layers
+        self.num_heads = self.model.cfg.n_heads
+        self.d_head = self.model.cfg.d_head
         
-        total_batches = (len(prompts) + batch_size - 1) // batch_size
-        for batch_idx, i in enumerate(range(0, len(prompts), batch_size)):
-            batch_prompts = prompts[i:i + batch_size]
-            print(f"    Batch {batch_idx + 1}/{total_batches}: processing {len(batch_prompts)} prompts...")
-            
-            # Tokenize batch
-            inputs = self.tokenizer(
-                batch_prompts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=max_length,
-            ).to(self.device)
-            
-            # Forward pass with attention outputs
-            with torch.no_grad():
-                outputs = self.model(
-                    input_ids=inputs["input_ids"],
-                    attention_mask=inputs["attention_mask"],
-                    output_attentions=True,
-                    return_dict=True,
-                )
-            
-            # Process attentions: tuple of (batch, num_heads, seq_len, seq_len) per layer
-            attentions = outputs.attentions  # tuple of length num_layers
-            
-            # Compute statistics for each example in batch
-            for b in range(len(batch_prompts)):
-                # Get attention mask for this example to identify valid positions
-                mask = inputs["attention_mask"][b]
-                valid_len = mask.sum().item()
-                
-                example_entropy = np.zeros((self.num_layers, self.num_heads))
-                example_norm = np.zeros((self.num_layers, self.num_heads))
-                
-                for layer_idx, layer_attn in enumerate(attentions):
-                    # layer_attn shape: (batch, num_heads, seq_len, seq_len)
-                    attn = layer_attn[b]  # (num_heads, seq_len, seq_len)
-                    
-                    for head_idx in range(self.num_heads):
-                        head_attn = attn[head_idx, :valid_len, :valid_len]  # (valid_len, valid_len)
-                        
-                        # Compute attention entropy (averaged over query positions)
-                        # Entropy = -sum(p * log(p)) for each query position
-                        entropy = self._compute_entropy(head_attn)
-                        example_entropy[layer_idx, head_idx] = entropy
-                        
-                        # Compute attention L2 norm (Frobenius norm of attention matrix)
-                        norm = torch.norm(head_attn, p='fro').item()
-                        example_norm[layer_idx, head_idx] = norm
-                
-                self.attention_entropy.append(example_entropy)
-                self.attention_norm.append(example_norm)
-            
-            # Free memory
-            del outputs, attentions
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        print(f"  Model loaded: {self.num_layers} layers, {self.num_heads} heads")
+        
+        # Storage for analysis results
+        self.head_importance_scores: np.ndarray | None = None
     
-    def _compute_entropy(self, attn_matrix: torch.Tensor, eps: float = 1e-10) -> float:
-        """Compute mean attention entropy across query positions.
+    def _get_logit_diff(
+        self,
+        logits: torch.Tensor,
+        target_tokens: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute average log probability of target tokens.
         
-        Entropy measures how "spread out" the attention is. High entropy means
-        attention is distributed across many positions; low entropy means focused.
+        This serves as a proxy for "how well the model is doing" - higher is better.
+        """
+        # logits: (batch, seq, vocab)
+        # target_tokens: (batch, seq)
+        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+        
+        # Gather log probs for target tokens
+        # target_tokens for next-token prediction is input shifted by 1
+        target_log_probs = torch.gather(
+            log_probs[:, :-1, :],  # (batch, seq-1, vocab)
+            dim=-1,
+            index=target_tokens[:, 1:].unsqueeze(-1)  # (batch, seq-1, 1)
+        ).squeeze(-1)  # (batch, seq-1)
+        
+        if attention_mask is not None:
+            # Only consider non-padding positions
+            mask = attention_mask[:, 1:]  # shift to match target
+            target_log_probs = target_log_probs * mask
+            return target_log_probs.sum() / mask.sum()
+        else:
+            return target_log_probs.mean()
+    
+    def run_attention_knockout(
+        self,
+        prompts: Sequence[str],
+        batch_size: int = 4,
+        use_chat_template: bool = True,
+    ) -> np.ndarray:
+        """Run attention knockout to measure head importance.
+        
+        For each attention head, we zero out its output and measure how much
+        the model's loss increases. Heads that cause large loss increases
+        are more important.
         
         Args:
-            attn_matrix: Attention weights of shape (query_len, key_len).
-            eps: Small constant for numerical stability.
+            prompts: List of prompts to evaluate on.
+            batch_size: Batch size for processing.
+            use_chat_template: Whether to apply chat template.
             
         Returns:
-            Mean entropy across all query positions.
+            Array of shape (num_layers, num_heads) with importance scores.
+            Higher scores = more important heads.
         """
-        # attn_matrix rows should sum to 1 (softmax output)
-        # Entropy for each row: -sum(p * log(p))
-        log_attn = torch.log(attn_matrix + eps)
-        entropy_per_query = -torch.sum(attn_matrix * log_attn, dim=-1)  # (query_len,)
-        return entropy_per_query.mean().item()
+        print(f"\nRunning attention knockout analysis...")
+        print(f"  Testing {self.num_layers * self.num_heads} heads")
+        
+        # Format prompts
+        if use_chat_template:
+            formatted = []
+            for p in prompts:
+                try:
+                    # TransformerLens models may have different chat templates
+                    formatted.append(f"<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n")
+                except:
+                    formatted.append(p)
+            prompts = formatted
+        
+        # Get baseline loss
+        baseline_losses = []
+        
+        for i in range(0, len(prompts), batch_size):
+            batch = prompts[i:i + batch_size]
+            tokens = self.model.to_tokens(batch, prepend_bos=True)
+            
+            with torch.no_grad():
+                logits = self.model(tokens)
+                loss = self._get_logit_diff(logits, tokens)
+                baseline_losses.append(loss.item())
+        
+        baseline_loss = np.mean(baseline_losses)
+        print(f"  Baseline loss: {baseline_loss:.4f}")
+        
+        # Test each head
+        head_importance = np.zeros((self.num_layers, self.num_heads))
+        
+        for layer in range(self.num_layers):
+            print(f"  Layer {layer + 1}/{self.num_layers}...", end=" ", flush=True)
+            
+            for head in range(self.num_heads):
+                # Create hook to zero out this head's output
+                def knockout_hook(
+                    activation: torch.Tensor,
+                    hook: HookPoint,
+                    head_idx: int,
+                ) -> torch.Tensor:
+                    # activation shape: (batch, seq, num_heads, d_head)
+                    activation[:, :, head_idx, :] = 0
+                    return activation
+                
+                hook_fn = partial(knockout_hook, head_idx=head)
+                hook_name = f"blocks.{layer}.attn.hook_z"
+                
+                # Run with knockout
+                knockout_losses = []
+                for i in range(0, len(prompts), batch_size):
+                    batch = prompts[i:i + batch_size]
+                    tokens = self.model.to_tokens(batch, prepend_bos=True)
+                    
+                    with torch.no_grad():
+                        logits = self.model.run_with_hooks(
+                            tokens,
+                            fwd_hooks=[(hook_name, hook_fn)],
+                        )
+                        loss = self._get_logit_diff(logits, tokens)
+                        knockout_losses.append(loss.item())
+                
+                knockout_loss = np.mean(knockout_losses)
+                
+                # Importance = how much loss increased when we knocked out this head
+                # Negative because lower log prob = higher loss = more important
+                head_importance[layer, head] = baseline_loss - knockout_loss
+            
+            print(f"done")
+        
+        self.head_importance_scores = head_importance
+        return head_importance
     
-    def analyze(
+    def run_activation_patching(
         self,
-        success_mask: Sequence[bool],
+        clean_prompts: Sequence[str],
+        corrupted_prompts: Sequence[str],
+        batch_size: int = 4,
+        metric: str = "logit_diff",
+    ) -> np.ndarray:
+        """Run activation patching to find causal heads.
+        
+        This is the gold standard for causal circuit analysis:
+        1. Run model on "clean" examples (successful instruction following)
+        2. Run model on "corrupted" examples (failed instruction following)
+        3. For each head, patch its activation from clean → corrupted
+        4. Measure how much this restores the clean behavior
+        
+        Heads that restore behavior when patched are causally important.
+        
+        Args:
+            clean_prompts: Prompts where model succeeds.
+            corrupted_prompts: Prompts where model fails (same length).
+            batch_size: Batch size for processing.
+            metric: Metric to use ("logit_diff" or "loss").
+            
+        Returns:
+            Array of shape (num_layers, num_heads) with patching scores.
+            Higher = more causal importance.
+        """
+        if len(clean_prompts) != len(corrupted_prompts):
+            raise ValueError("clean_prompts and corrupted_prompts must have same length")
+        
+        print(f"\nRunning activation patching analysis...")
+        print(f"  {len(clean_prompts)} prompt pairs")
+        print(f"  Testing {self.num_layers * self.num_heads} heads")
+        
+        patching_scores = np.zeros((self.num_layers, self.num_heads))
+        
+        for batch_start in range(0, len(clean_prompts), batch_size):
+            batch_end = min(batch_start + batch_size, len(clean_prompts))
+            clean_batch = clean_prompts[batch_start:batch_end]
+            corrupted_batch = corrupted_prompts[batch_start:batch_end]
+            
+            # Tokenize
+            clean_tokens = self.model.to_tokens(clean_batch, prepend_bos=True)
+            corrupted_tokens = self.model.to_tokens(corrupted_batch, prepend_bos=True)
+            
+            # Get clean activations (cache them)
+            with torch.no_grad():
+                _, clean_cache = self.model.run_with_cache(clean_tokens)
+            
+            # Get corrupted baseline
+            with torch.no_grad():
+                corrupted_logits = self.model(corrupted_tokens)
+                corrupted_metric = self._get_logit_diff(corrupted_logits, corrupted_tokens).item()
+            
+            # Get clean baseline  
+            with torch.no_grad():
+                clean_logits = self.model(clean_tokens)
+                clean_metric = self._get_logit_diff(clean_logits, clean_tokens).item()
+            
+            total_effect = clean_metric - corrupted_metric
+            
+            # Patch each head
+            for layer in range(self.num_layers):
+                for head in range(self.num_heads):
+                    def patching_hook(
+                        activation: torch.Tensor,
+                        hook: HookPoint,
+                        clean_activation: torch.Tensor,
+                        head_idx: int,
+                    ) -> torch.Tensor:
+                        # Patch just this head's output
+                        activation[:, :, head_idx, :] = clean_activation[:, :, head_idx, :]
+                        return activation
+                    
+                    # Get the clean activation for this layer
+                    clean_z = clean_cache[f"blocks.{layer}.attn.hook_z"]
+                    hook_fn = partial(patching_hook, clean_activation=clean_z, head_idx=head)
+                    hook_name = f"blocks.{layer}.attn.hook_z"
+                    
+                    with torch.no_grad():
+                        patched_logits = self.model.run_with_hooks(
+                            corrupted_tokens,
+                            fwd_hooks=[(hook_name, hook_fn)],
+                        )
+                        patched_metric = self._get_logit_diff(patched_logits, corrupted_tokens).item()
+                    
+                    # How much did patching this head restore clean behavior?
+                    restoration = patched_metric - corrupted_metric
+                    if total_effect != 0:
+                        patching_scores[layer, head] += restoration / total_effect
+            
+            # Clear cache
+            del clean_cache
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        
+        # Average over batches
+        num_batches = (len(clean_prompts) + batch_size - 1) // batch_size
+        patching_scores /= num_batches
+        
+        self.head_importance_scores = patching_scores
+        return patching_scores
+    
+    def run_attention_pattern_analysis(
+        self,
+        success_prompts: Sequence[str],
+        failure_prompts: Sequence[str],
+        batch_size: int = 4,
+    ) -> np.ndarray:
+        """Analyze attention patterns to find differentially active heads.
+        
+        This is a faster (but less rigorous) alternative to activation patching.
+        Compares attention entropy between success and failure prompts.
+        
+        Args:
+            success_prompts: Prompts where model succeeds.
+            failure_prompts: Prompts where model fails.
+            batch_size: Batch size for processing.
+            
+        Returns:
+            Array of shape (num_layers, num_heads) with delta scores.
+        """
+        print(f"\nRunning attention pattern analysis...")
+        
+        def get_attention_stats(prompts):
+            all_entropy = []
+            
+            for i in range(0, len(prompts), batch_size):
+                batch = prompts[i:i + batch_size]
+                tokens = self.model.to_tokens(batch, prepend_bos=True)
+                
+                with torch.no_grad():
+                    _, cache = self.model.run_with_cache(tokens)
+                
+                batch_entropy = np.zeros((len(batch), self.num_layers, self.num_heads))
+                
+                for layer in range(self.num_layers):
+                    # attention pattern: (batch, num_heads, seq, seq)
+                    pattern = cache[f"blocks.{layer}.attn.hook_pattern"]
+                    
+                    for head in range(self.num_heads):
+                        head_pattern = pattern[:, head, :, :]  # (batch, seq, seq)
+                        
+                        # Compute entropy for each example
+                        for b in range(len(batch)):
+                            attn = head_pattern[b]
+                            # Entropy: -sum(p * log(p))
+                            log_attn = torch.log(attn + 1e-10)
+                            entropy = -torch.sum(attn * log_attn, dim=-1).mean()
+                            batch_entropy[b, layer, head] = entropy.item()
+                
+                all_entropy.append(batch_entropy)
+                del cache
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            
+            return np.concatenate(all_entropy, axis=0)
+        
+        print(f"  Analyzing {len(success_prompts)} success prompts...")
+        success_entropy = get_attention_stats(success_prompts)
+        
+        print(f"  Analyzing {len(failure_prompts)} failure prompts...")
+        failure_entropy = get_attention_stats(failure_prompts)
+        
+        # Compute delta: higher entropy in failures = more diffuse attention
+        success_mean = success_entropy.mean(axis=0)
+        failure_mean = failure_entropy.mean(axis=0)
+        delta = failure_mean - success_mean
+        
+        self.head_importance_scores = delta
+        return delta
+    
+    def get_top_heads(
+        self,
+        scores: np.ndarray | None = None,
         top_k: int = 10,
         alpha_scale: float = 0.05,
         alpha_min: float = 0.001,
         alpha_max: float = 0.1,
-        metric: str = "entropy",
-    ) -> tuple[dict[int, list[int]], float | dict[int, list[float]]]:
-        """Analyze captured attention patterns to derive PASTA configuration.
-        
-        Computes contrastive statistics between success and failure groups:
-        - For each (layer, head), compute mean statistic for successes vs failures
-        - Delta = failure_mean - success_mean
-        - Positive delta indicates heads more active during failures
-        - Select top-K heads with highest positive delta
+    ) -> tuple[dict[int, list[int]], float]:
+        """Get top-K heads from importance scores.
         
         Args:
-            success_mask: Boolean list where True = instruction-following success.
-            top_k: Number of top heads to select for PASTA config.
-            alpha_scale: Base scaling factor for alpha values.
-            alpha_min: Minimum alpha value (clipping).
-            alpha_max: Maximum alpha value (clipping).
-            metric: Which metric to use - "entropy" or "norm".
+            scores: Head importance scores (num_layers, num_heads).
+                   If None, uses self.head_importance_scores.
+            top_k: Number of top heads to select.
+            alpha_scale: Base alpha scaling factor.
+            alpha_min: Minimum alpha value.
+            alpha_max: Maximum alpha value.
             
         Returns:
-            Tuple of (head_config, alpha):
-            - head_config: Dict mapping layer index to list of head indices
-            - alpha: Either a single float (mean alpha) or dict with per-head alphas
-            
-        Raises:
-            ValueError: If no attention patterns have been captured.
+            Tuple of (head_config, alpha) for PASTA.
         """
-        if not self.attention_entropy:
-            raise ValueError("No attention patterns captured. Call capture_batch() first.")
+        if scores is None:
+            scores = self.head_importance_scores
+        if scores is None:
+            raise ValueError("No scores available. Run an analysis method first.")
         
-        if len(success_mask) != len(self.attention_entropy):
-            raise ValueError(
-                f"success_mask length ({len(success_mask)}) doesn't match "
-                f"captured examples ({len(self.attention_entropy)})"
-            )
+        # Handle NaN
+        scores = np.nan_to_num(scores, nan=0.0)
         
-        # Select metric
-        if metric == "entropy":
-            stats = np.array(self.attention_entropy)  # (num_examples, num_layers, num_heads)
-        elif metric == "norm":
-            stats = np.array(self.attention_norm)
-        else:
-            raise ValueError(f"Unknown metric: {metric}. Use 'entropy' or 'norm'.")
+        # Flatten and get top-K
+        flat_scores = scores.flatten()
+        top_indices = np.argsort(np.abs(flat_scores))[-top_k:][::-1]
         
-        success_mask = np.array(success_mask)
-        
-        # Separate into success and failure groups
-        success_stats = stats[success_mask]
-        failure_stats = stats[~success_mask]
-        
-        if len(success_stats) == 0:
-            print("Warning: No successful examples. Using all examples as baseline.")
-            success_stats = stats
-        if len(failure_stats) == 0:
-            print("Warning: No failed examples. Cannot compute meaningful delta.")
-            # Return default config (first few layers, all heads)
-            return {0: list(range(self.num_heads)), 1: list(range(self.num_heads))}, alpha_scale
-        
-        # Compute mean statistics per (layer, head)
-        success_mean = success_stats.mean(axis=0)  # (num_layers, num_heads)
-        failure_mean = failure_stats.mean(axis=0)  # (num_layers, num_heads)
-        
-        # Compute delta: positive means higher activity during failures
-        # For entropy: higher entropy during failures = more diffuse attention = less focused
-        # These heads might benefit from PASTA steering to refocus attention
-        delta = failure_mean - success_mean  # (num_layers, num_heads)
-        
-        # Handle NaN values (can occur with very small sample sizes)
-        delta = np.nan_to_num(delta, nan=0.0)
-        
-        # Flatten and get top-K indices
-        flat_delta = delta.flatten()
-        top_k_indices = np.argsort(flat_delta)[-top_k:][::-1]  # Descending order
-        
-        # Convert flat indices to (layer, head) pairs
-        selected_heads: list[tuple[int, int, float]] = []
-        for flat_idx in top_k_indices:
-            layer_idx = int(flat_idx // self.num_heads)  # Convert to Python int
-            head_idx = int(flat_idx % self.num_heads)    # Convert to Python int
-            delta_value = float(flat_delta[flat_idx])    # Convert to Python float
-            
-            # Only include heads with positive delta (more active during failures)
-            if delta_value > 0:
-                selected_heads.append((layer_idx, head_idx, delta_value))
-        
-        if not selected_heads:
-            print("Warning: No heads with positive delta found. Using top heads by absolute value.")
-            abs_delta = np.abs(flat_delta)
-            top_k_indices = np.argsort(abs_delta)[-top_k:][::-1]
-            for flat_idx in top_k_indices:
-                layer_idx = int(flat_idx // self.num_heads)  # Convert to Python int
-                head_idx = int(flat_idx % self.num_heads)    # Convert to Python int
-                delta_value = float(abs_delta[flat_idx])     # Convert to Python float
-                selected_heads.append((layer_idx, head_idx, delta_value))
-        
-        # Build head_config dict: layer -> list of heads (ensure Python int types)
+        # Build head_config
         head_config: dict[int, list[int]] = {}
-        for layer_idx, head_idx, _ in selected_heads:
-            if layer_idx not in head_config:
-                head_config[layer_idx] = []
-            if head_idx not in head_config[layer_idx]:
-                head_config[layer_idx].append(head_idx)
+        selected_scores = []
+        
+        for flat_idx in top_indices:
+            layer = int(flat_idx // self.num_heads)
+            head = int(flat_idx % self.num_heads)
+            score = float(flat_scores[flat_idx])
+            
+            if layer not in head_config:
+                head_config[layer] = []
+            head_config[layer].append(head)
+            selected_scores.append(abs(score))
         
         # Sort heads within each layer
-        for layer_idx in head_config:
-            head_config[layer_idx] = sorted(head_config[layer_idx])
+        for layer in head_config:
+            head_config[layer] = sorted(head_config[layer])
         
-        # Compute alpha: proportional to normalized delta
-        delta_values = np.array([d for _, _, d in selected_heads])
-        max_delta = delta_values.max() if len(delta_values) > 0 else 0
-        if max_delta > 0:
-            # Normalize to [0, 1] range, then scale
-            normalized_delta = delta_values / max_delta
-            mean_normalized = float(normalized_delta.mean())
-            alpha = float(np.clip(alpha_scale * (1 + mean_normalized), alpha_min, alpha_max))
+        # Compute alpha
+        if selected_scores and max(selected_scores) > 0:
+            normalized = np.array(selected_scores) / max(selected_scores)
+            mean_norm = float(normalized.mean())
+            alpha = float(np.clip(alpha_scale * (1 + mean_norm), alpha_min, alpha_max))
         else:
             alpha = float(alpha_scale)
         
-        # Print analysis summary
         print(f"\n=== Circuit Analysis Summary ===")
-        print(f"Total examples: {len(stats)}")
-        print(f"Successes: {success_mask.sum()}, Failures: {(~success_mask).sum()}")
-        print(f"Selected {len(selected_heads)} heads across {len(head_config)} layers")
+        print(f"Selected {top_k} heads across {len(head_config)} layers")
         print(f"Head config: {head_config}")
         print(f"Computed alpha: {alpha:.4f}")
         print(f"================================\n")
         
         return head_config, alpha
     
-    def get_detailed_analysis(
+    def visualize_scores(
         self,
-        success_mask: Sequence[bool],
-        metric: str = "entropy",
-    ) -> dict:
-        """Get detailed per-head analysis for inspection.
+        scores: np.ndarray | None = None,
+        title: str = "Head Importance Scores",
+    ):
+        """Visualize head importance scores as a heatmap.
         
-        Returns comprehensive statistics for debugging and visualization.
-        
-        Args:
-            success_mask: Boolean list where True = instruction-following success.
-            metric: Which metric to analyze - "entropy" or "norm".
-            
-        Returns:
-            Dict containing:
-            - delta_matrix: (num_layers, num_heads) array of delta values
-            - success_mean: Mean statistics for successful examples
-            - failure_mean: Mean statistics for failed examples
-            - top_heads: List of (layer, head, delta) tuples sorted by delta
+        Requires matplotlib to be installed.
         """
-        if metric == "entropy":
-            stats = np.array(self.attention_entropy)
-        else:
-            stats = np.array(self.attention_norm)
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            print("matplotlib not available for visualization")
+            return
         
-        success_mask = np.array(success_mask)
+        if scores is None:
+            scores = self.head_importance_scores
+        if scores is None:
+            raise ValueError("No scores to visualize")
         
-        success_mean = stats[success_mask].mean(axis=0) if success_mask.any() else stats.mean(axis=0)
-        failure_mean = stats[~success_mask].mean(axis=0) if (~success_mask).any() else stats.mean(axis=0)
-        delta = failure_mean - success_mean
-        
-        # Get all heads sorted by delta
-        top_heads = []
-        for layer_idx in range(self.num_layers):
-            for head_idx in range(self.num_heads):
-                top_heads.append((layer_idx, head_idx, delta[layer_idx, head_idx]))
-        top_heads.sort(key=lambda x: x[2], reverse=True)
-        
-        return {
-            "delta_matrix": delta,
-            "success_mean": success_mean,
-            "failure_mean": failure_mean,
-            "top_heads": top_heads,
-            "num_examples": len(stats),
-            "num_successes": int(success_mask.sum()),
-            "num_failures": int((~success_mask).sum()),
-        }
-    
-    def reset(self) -> None:
-        """Clear all captured attention patterns."""
-        self.attention_entropy.clear()
-        self.attention_norm.clear()
+        plt.figure(figsize=(12, 8))
+        plt.imshow(scores, aspect='auto', cmap='RdBu_r')
+        plt.colorbar(label='Importance Score')
+        plt.xlabel('Head')
+        plt.ylabel('Layer')
+        plt.title(title)
+        plt.tight_layout()
+        plt.savefig('head_importance.png', dpi=150)
+        print("Saved visualization to head_importance.png")
 
 
 def create_circuit_pasta(
-    model: PreTrainedModel,
-    tokenizer: PreTrainedTokenizerBase,
+    model_name: str,
     prompts: Sequence[str],
     success_mask: Sequence[bool],
     top_k: int = 10,
     alpha_scale: float = 0.05,
     scale_position: str = "exclude",
-    batch_size: int = 8,
-    **tracker_kwargs,
+    method: str = "knockout",
+    **kwargs,
 ):
     """Convenience function to create a circuit-informed PASTA instance.
     
-    Combines CircuitTracker analysis with PASTA instantiation in one call.
-    
     Args:
-        model: HuggingFace model to analyze.
-        tokenizer: Tokenizer for the model.
-        prompts: List of prompts to analyze attention patterns on.
-        success_mask: Boolean list indicating instruction-following success/failure.
-        top_k: Number of top circuit heads to select.
+        model_name: HuggingFace model name.
+        prompts: List of prompts to analyze.
+        success_mask: Boolean list indicating success/failure.
+        top_k: Number of top heads to select.
         alpha_scale: Base alpha scaling factor.
-        scale_position: PASTA scale position ("include", "exclude", or "generation").
-        batch_size: Batch size for attention capture.
-        **tracker_kwargs: Additional arguments passed to CircuitTracker.analyze().
+        scale_position: PASTA scale position.
+        method: Analysis method ("knockout", "patching", or "pattern").
+        **kwargs: Additional arguments for the analysis method.
         
     Returns:
-        Configured PASTA instance with circuit-derived head_config and alpha.
-        
-    Example:
-        >>> circuit_pasta = create_circuit_pasta(
-        ...     model, tokenizer, prompts, follow_all_instructions,
-        ...     top_k=10, alpha_scale=0.05
-        ... )
-        >>> pipeline = SteeringPipeline(controls=[circuit_pasta], ...)
+        Configured PASTA instance.
     """
     from aisteer360.algorithms.state_control.pasta.control import PASTA
     
-    # Create tracker and capture patterns
-    tracker = CircuitTracker(model, tokenizer)
-    tracker.capture_batch(prompts, batch_size=batch_size)
+    tracker = CircuitTracker(model_name)
     
-    # Analyze and get config
-    head_config, alpha = tracker.analyze(
-        success_mask=success_mask,
-        top_k=top_k,
-        alpha_scale=alpha_scale,
-        **tracker_kwargs,
-    )
+    success_prompts = [p for p, s in zip(prompts, success_mask) if s]
+    failure_prompts = [p for p, s in zip(prompts, success_mask) if not s]
     
-    # Create and return PASTA instance
+    if method == "knockout":
+        scores = tracker.run_attention_knockout(prompts, **kwargs)
+    elif method == "patching":
+        # For patching, we need paired examples
+        min_len = min(len(success_prompts), len(failure_prompts))
+        scores = tracker.run_activation_patching(
+            success_prompts[:min_len],
+            failure_prompts[:min_len],
+            **kwargs,
+        )
+    elif method == "pattern":
+        scores = tracker.run_attention_pattern_analysis(
+            success_prompts, failure_prompts, **kwargs
+        )
+    else:
+        raise ValueError(f"Unknown method: {method}")
+    
+    head_config, alpha = tracker.get_top_heads(scores, top_k=top_k, alpha_scale=alpha_scale)
+    
     return PASTA(
         head_config=head_config,
         alpha=alpha,
@@ -432,9 +540,6 @@ def create_circuit_pasta(
 # =============================================================================
 # RUNNABLE EVALUATION SCRIPT
 # =============================================================================
-# Usage: python -m aisteer360.algorithms.state_control.pasta.circuit_tracker
-# Or:    python circuit_tracker.py
-# =============================================================================
 
 def run_circuit_pasta_evaluation(
     model_name: str = "Qwen/Qwen2.5-1.5B-Instruct",
@@ -444,27 +549,12 @@ def run_circuit_pasta_evaluation(
     batch_size: int = 8,
     max_new_tokens: int = 1024,
     save_dir: str = "./circuit_pasta_results",
+    analysis_method: str = "knockout",
 ):
     """
     Run complete circuit-informed PASTA evaluation on Split-IFEval.
     
-    This function:
-    1. Loads the Split-IFEval dataset
-    2. Runs baseline evaluation to get instruction-following success/failure
-    3. Captures attention patterns during forward passes
-    4. Analyzes circuits to find heads correlated with failures
-    5. Creates circuit-informed PASTA configuration
-    6. Re-runs evaluation with circuit PASTA
-    7. Compares results with baseline and manual PASTA
-    
-    Args:
-        model_name: HuggingFace model ID or path.
-        num_samples: Number of examples to evaluate.
-        top_k: Number of top circuit heads to select for PASTA.
-        alpha_scale: Base alpha scaling factor.
-        batch_size: Batch size for generation and attention capture.
-        max_new_tokens: Maximum tokens to generate.
-        save_dir: Directory to save results.
+    Uses TransformerLens for causal circuit analysis.
     """
     import gc
     import json
@@ -476,14 +566,13 @@ def run_circuit_pasta_evaluation(
     from transformers import AutoModelForCausalLM, AutoTokenizer, logging
     
     from aisteer360.algorithms.state_control.pasta.control import PASTA
-    from aisteer360.algorithms.core.steering_pipeline import SteeringPipeline
     from aisteer360.evaluation.use_cases.instruction_following import InstructionFollowing
     from aisteer360.evaluation.metrics.custom.instruction_following.strict_instruction import StrictInstruction
     from aisteer360.evaluation.benchmark import Benchmark
     
     logging.set_verbosity_error()
     
-    # Download required NLTK data
+    # Download NLTK data
     print("Downloading required NLTK data...")
     nltk.download('punkt_tab', quiet=True)
     nltk.download('punkt', quiet=True)
@@ -498,17 +587,16 @@ def run_circuit_pasta_evaluation(
     total_start = time.time()
     
     print("=" * 60)
-    print("CIRCUIT-INFORMED PASTA EVALUATION")
+    print("CIRCUIT-INFORMED PASTA EVALUATION (TransformerLens)")
     print("=" * 60)
     print(f"Model: {model_name}")
     print(f"Samples: {num_samples}")
     print(f"Top-K heads: {top_k}")
     print(f"Alpha scale: {alpha_scale}")
+    print(f"Analysis method: {analysis_method}")
     print("=" * 60)
     
-    # -------------------------------------------------------------------------
     # Step 1: Load dataset
-    # -------------------------------------------------------------------------
     step_start = time.time()
     print("\n[1/6] Loading Split-IFEval dataset...")
     dataset = load_dataset("ibm-research/Split-IFEval", split="train")
@@ -517,122 +605,106 @@ def run_circuit_pasta_evaluation(
     print(f"  Loaded {len(evaluation_data)} examples")
     step_start = log_time(step_start, "Dataset loading")
     
-    # -------------------------------------------------------------------------
-    # Step 2: Create use case and run baseline
-    # -------------------------------------------------------------------------
+    # Step 2: Run baseline evaluation
     print("\n[2/6] Running baseline evaluation...")
-    print("  Setting up InstructionFollowing use case...")
     instruction_following = InstructionFollowing(
         evaluation_data=evaluation_data,
         evaluation_metrics=[StrictInstruction()],
     )
     
-    # Load model for baseline
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map="auto",
-        attn_implementation="eager",  # Required for attention outputs
-        torch_dtype=torch.float16,
-    )
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"
-    
-    # Run baseline benchmark
-    print("  Creating baseline benchmark...")
     baseline_benchmark = Benchmark(
         use_case=instruction_following,
         base_model_name_or_path=model_name,
         steering_pipelines={"baseline": []},
-        gen_kwargs={
-            "max_new_tokens": max_new_tokens,
-            "do_sample": False,
-        },
-        hf_model_kwargs={
-            "attn_implementation": "eager",
-            "torch_dtype": torch.float16,
-        },
+        gen_kwargs={"max_new_tokens": max_new_tokens, "do_sample": False},
+        hf_model_kwargs={"attn_implementation": "eager", "torch_dtype": torch.float16},
         batch_size=batch_size,
     )
-    print("  Starting baseline generation (this may take a while)...")
-    print(f"  Processing {num_samples} samples with batch_size={batch_size}")
     baseline_profiles = baseline_benchmark.run()
-    print("  [done] Baseline generation complete!")
     step_start = log_time(step_start, "Baseline evaluation")
     
-    # Extract success/failure mask
     baseline_results = baseline_profiles["baseline"][0]["evaluations"]["StrictInstruction"]
-    follow_all_instructions = baseline_results["follow_all_instructions"]
+    follow_all = baseline_results["follow_all_instructions"]
     
     print(f"Baseline prompt accuracy: {baseline_results['strict_prompt_accuracy']:.2%}")
     print(f"Baseline instruction accuracy: {baseline_results['strict_instruction_accuracy']:.2%}")
-    print(f"Successes: {sum(follow_all_instructions)}, Failures: {len(follow_all_instructions) - sum(follow_all_instructions)}")
+    print(f"Successes: {sum(follow_all)}, Failures: {len(follow_all) - sum(follow_all)}")
     
-    # -------------------------------------------------------------------------
-    # Step 3: Capture attention patterns
-    # -------------------------------------------------------------------------
-    print("\n[3/6] Capturing attention patterns...")
-    print(f"  Model has {baseline_benchmark._base_model.config.num_hidden_layers} layers, {baseline_benchmark._base_model.config.num_attention_heads} heads")
+    # Clean up baseline model before loading TransformerLens
+    del baseline_benchmark
+    gc.collect()
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
     
-    # Use the loaded model from benchmark
-    tracker = CircuitTracker(
-        model=baseline_benchmark._base_model,
-        tokenizer=baseline_benchmark._base_tokenizer,
-    )
-    print(f"  Processing {len(prompts)} prompts in batches of {batch_size}...")
-    tracker.capture_batch(prompts, batch_size=batch_size)
-    print(f"  [done] Captured attention patterns for {len(prompts)} prompts")
-    step_start = log_time(step_start, "Attention capture")
+    # Step 3: Circuit analysis with TransformerLens
+    print("\n[3/6] Running circuit analysis with TransformerLens...")
     
-    # -------------------------------------------------------------------------
-    # Step 4: Analyze circuits
-    # -------------------------------------------------------------------------
-    print("\n[4/6] Analyzing circuits...")
-    print(f"  Computing contrastive statistics between success/failure groups...")
-    print(f"  Selecting top-{top_k} heads with highest failure-success delta...")
-    head_config, alpha = tracker.analyze(
-        success_mask=follow_all_instructions,
-        top_k=top_k,
-        alpha_scale=alpha_scale,
-    )
+    tracker = CircuitTracker(model_name)
     
-    # Get detailed analysis for reporting
-    detailed = tracker.get_detailed_analysis(follow_all_instructions)
-    print(f"\nTop 5 circuit heads (by delta):")
-    for layer, head, delta in detailed["top_heads"][:5]:
-        print(f"  Layer {layer}, Head {head}: Δ = {delta:.4f}")
+    success_prompts = [p for p, s in zip(prompts, follow_all) if s]
+    failure_prompts = [p for p, s in zip(prompts, follow_all) if not s]
     
-    # -------------------------------------------------------------------------
-    # Step 5: Create steering pipelines and re-run
-    # -------------------------------------------------------------------------
+    if analysis_method == "knockout":
+        scores = tracker.run_attention_knockout(prompts, batch_size=batch_size)
+    elif analysis_method == "patching":
+        min_len = min(len(success_prompts), len(failure_prompts))
+        if min_len == 0:
+            print("Warning: Need both successes and failures for patching. Using knockout.")
+            scores = tracker.run_attention_knockout(prompts, batch_size=batch_size)
+        else:
+            scores = tracker.run_activation_patching(
+                success_prompts[:min_len],
+                failure_prompts[:min_len],
+                batch_size=batch_size,
+            )
+    else:  # pattern
+        if len(success_prompts) == 0 or len(failure_prompts) == 0:
+            print("Warning: Need both successes and failures. Using knockout.")
+            scores = tracker.run_attention_knockout(prompts, batch_size=batch_size)
+        else:
+            scores = tracker.run_attention_pattern_analysis(
+                success_prompts, failure_prompts, batch_size=batch_size
+            )
+    
+    step_start = log_time(step_start, "Circuit analysis")
+    
+    # Step 4: Get top heads
+    print("\n[4/6] Selecting top circuit heads...")
+    head_config, alpha = tracker.get_top_heads(scores, top_k=top_k, alpha_scale=alpha_scale)
+    
+    # Show top heads
+    flat_scores = scores.flatten()
+    top_indices = np.argsort(np.abs(flat_scores))[-5:][::-1]
+    print("\nTop 5 circuit heads:")
+    for idx in top_indices:
+        layer = idx // tracker.num_heads
+        head = idx % tracker.num_heads
+        score = flat_scores[idx]
+        print(f"  Layer {layer}, Head {head}: score = {score:.4f}")
+    
+    # Clean up TransformerLens model
+    del tracker
+    gc.collect()
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    
+    # Step 5: Run comparison
     print("\n[5/6] Running evaluation with circuit PASTA...")
     
-    # Create circuit PASTA
     circuit_pasta = PASTA(
         head_config=head_config,
         alpha=alpha,
         scale_position="exclude",
     )
     
-    # Also create manual PASTA for comparison (using layers 8,9 as in notebook)
     manual_pasta = PASTA(
         head_config=[8, 9],
         alpha=0.01,
         scale_position="exclude",
     )
     
-    # Re-create use case (to reset state)
     instruction_following_2 = InstructionFollowing(
         evaluation_data=evaluation_data,
         evaluation_metrics=[StrictInstruction()],
     )
-    
-    # Run comparison benchmark
-    print("  Creating comparison benchmark with 3 pipelines...")
-    print("    - baseline (no steering)")
-    print("    - manual_pasta (layers 8,9, alpha=0.01)")
-    print(f"    - circuit_pasta (learned config, alpha={alpha:.4f})")
     
     comparison_benchmark = Benchmark(
         use_case=instruction_following_2,
@@ -642,56 +714,40 @@ def run_circuit_pasta_evaluation(
             "manual_pasta": [manual_pasta],
             "circuit_pasta": [circuit_pasta],
         },
-        runtime_overrides={
-            "PASTA": {"substrings": "instructions"},
-        },
-        gen_kwargs={
-            "max_new_tokens": max_new_tokens,
-            "do_sample": False,
-            "output_attentions": True,
-        },
-        hf_model_kwargs={
-            "attn_implementation": "eager",
-            "torch_dtype": torch.float16,
-        },
+        runtime_overrides={"PASTA": {"substrings": "instructions"}},
+        gen_kwargs={"max_new_tokens": max_new_tokens, "do_sample": False},
+        hf_model_kwargs={"attn_implementation": "eager", "torch_dtype": torch.float16},
         batch_size=batch_size,
     )
     
-    print("  Starting comparison benchmark (3 runs, may take a while)...")
     comparison_profiles = comparison_benchmark.run()
-    print("  [done] Comparison benchmark complete!")
     step_start = log_time(step_start, "Comparison benchmark")
     
-    # -------------------------------------------------------------------------
     # Step 6: Report results
-    # -------------------------------------------------------------------------
     print("\n[6/6] Results Summary")
     print("=" * 60)
     
     results_table = []
     for method_name in ["baseline", "manual_pasta", "circuit_pasta"]:
-        scores = comparison_profiles[method_name][0]["evaluations"]["StrictInstruction"]
+        scores_dict = comparison_profiles[method_name][0]["evaluations"]["StrictInstruction"]
         results_table.append({
             "method": method_name,
-            "prompt_accuracy": scores["strict_prompt_accuracy"],
-            "instruction_accuracy": scores["strict_instruction_accuracy"],
+            "prompt_accuracy": scores_dict["strict_prompt_accuracy"],
+            "instruction_accuracy": scores_dict["strict_instruction_accuracy"],
         })
         print(f"\n{method_name.upper()}:")
-        print(f"  Prompt Accuracy:      {scores['strict_prompt_accuracy']:.2%}")
-        print(f"  Instruction Accuracy: {scores['strict_instruction_accuracy']:.2%}")
+        print(f"  Prompt Accuracy:      {scores_dict['strict_prompt_accuracy']:.2%}")
+        print(f"  Instruction Accuracy: {scores_dict['strict_instruction_accuracy']:.2%}")
     
-    # Compute improvements
     baseline_prompt = results_table[0]["prompt_accuracy"]
     baseline_instr = results_table[0]["instruction_accuracy"]
     
     print("\n" + "-" * 60)
     print("IMPROVEMENTS OVER BASELINE:")
     for result in results_table[1:]:
-        prompt_diff = result["prompt_accuracy"] - baseline_prompt
-        instr_diff = result["instruction_accuracy"] - baseline_instr
         print(f"\n{result['method'].upper()}:")
-        print(f"  Prompt:      {prompt_diff:+.2%}")
-        print(f"  Instruction: {instr_diff:+.2%}")
+        print(f"  Prompt:      {result['prompt_accuracy'] - baseline_prompt:+.2%}")
+        print(f"  Instruction: {result['instruction_accuracy'] - baseline_instr:+.2%}")
     
     print("\n" + "=" * 60)
     
@@ -705,20 +761,13 @@ def run_circuit_pasta_evaluation(
             "num_samples": num_samples,
             "top_k": top_k,
             "alpha_scale": alpha_scale,
+            "analysis_method": analysis_method,
         },
         "circuit_config": {
             "head_config": {str(k): v for k, v in head_config.items()},
             "alpha": alpha,
         },
         "results": results_table,
-        "detailed_analysis": {
-            "top_10_heads": [
-                {"layer": int(l), "head": int(h), "delta": float(d)}
-                for l, h, d in detailed["top_heads"][:10]
-            ],
-            "num_successes": detailed["num_successes"],
-            "num_failures": detailed["num_failures"],
-        }
     }
     
     with open(save_path / "circuit_pasta_results.json", "w") as f:
@@ -726,15 +775,11 @@ def run_circuit_pasta_evaluation(
     
     print(f"\nResults saved to: {save_path / 'circuit_pasta_results.json'}")
     
-    # Total time
     total_elapsed = time.time() - total_start
-    print(f"\n[COMPLETE] Total evaluation time: {total_elapsed/60:.1f} minutes ({total_elapsed:.0f}s)")
+    print(f"\n[COMPLETE] Total time: {total_elapsed/60:.1f} minutes ({total_elapsed:.0f}s)")
     
-    # Cleanup
-    del tracker, model, baseline_benchmark, comparison_benchmark
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
     
     return results
 
@@ -743,50 +788,20 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(
-        description="Run circuit-informed PASTA evaluation on Split-IFEval",
+        description="Run circuit-informed PASTA evaluation using TransformerLens",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    parser.add_argument("--model", "-m", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
+    parser.add_argument("--num-samples", "-n", type=int, default=50)
+    parser.add_argument("--top-k", "-k", type=int, default=10)
+    parser.add_argument("--alpha-scale", "-a", type=float, default=0.05)
+    parser.add_argument("--batch-size", "-b", type=int, default=8)
+    parser.add_argument("--max-new-tokens", type=int, default=1024)
+    parser.add_argument("--save-dir", "-o", type=str, default="./circuit_pasta_results")
     parser.add_argument(
-        "--model", "-m",
-        type=str,
-        default="Qwen/Qwen2.5-1.5B-Instruct",
-        help="HuggingFace model name or path",
-    )
-    parser.add_argument(
-        "--num-samples", "-n",
-        type=int,
-        default=50,
-        help="Number of evaluation samples",
-    )
-    parser.add_argument(
-        "--top-k", "-k",
-        type=int,
-        default=10,
-        help="Number of top circuit heads to select",
-    )
-    parser.add_argument(
-        "--alpha-scale", "-a",
-        type=float,
-        default=0.05,
-        help="Base alpha scaling factor for PASTA",
-    )
-    parser.add_argument(
-        "--batch-size", "-b",
-        type=int,
-        default=8,
-        help="Batch size for generation and attention capture",
-    )
-    parser.add_argument(
-        "--max-new-tokens",
-        type=int,
-        default=1024,
-        help="Maximum new tokens to generate",
-    )
-    parser.add_argument(
-        "--save-dir", "-o",
-        type=str,
-        default="./circuit_pasta_results",
-        help="Directory to save results",
+        "--method", type=str, default="knockout",
+        choices=["knockout", "patching", "pattern"],
+        help="Circuit analysis method: knockout (fastest), patching (gold standard), pattern (simple)"
     )
     
     args = parser.parse_args()
@@ -799,4 +814,5 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         max_new_tokens=args.max_new_tokens,
         save_dir=args.save_dir,
+        analysis_method=args.method,
     )
