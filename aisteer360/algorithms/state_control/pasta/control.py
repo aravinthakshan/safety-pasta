@@ -57,7 +57,7 @@ class PASTA(StateControl):
     supports_batching: bool = True
     
     # Debug flag - set to True to see PASTA in action
-    DEBUG: bool = True
+    DEBUG: bool = False
     _debug_hook_count: int = 0
 
     # placeholders

@@ -691,14 +691,21 @@ def run_circuit_pasta_evaluation(
     
     circuit_pasta = PASTA(
         head_config=head_config,
-        alpha=alpha,
+        alpha=0.01,  # Aggressive alpha - log(0.01) = -4.6
+        scale_position="exclude",
+    )
+
+    manual_pasta = PASTA(
+        head_config=[8, 9],
+        alpha=0.01,  # Very aggressive - log(0.01) = -4.6
         scale_position="exclude",
     )
     
-    manual_pasta = PASTA(
+    # Also test "include" mode with high alpha (boost instructions)
+    boost_pasta = PASTA(
         head_config=[8, 9],
-        alpha=0.5,  # Increased from 0.01
-        scale_position="exclude",
+        alpha=10.0,  # log(10) = 2.3, BOOST attention to instructions
+        scale_position="include",
     )
     
     instruction_following_2 = InstructionFollowing(
@@ -713,6 +720,7 @@ def run_circuit_pasta_evaluation(
             "baseline": [],
             "manual_pasta": [manual_pasta],
             "circuit_pasta": [circuit_pasta],
+            "boost_pasta": [boost_pasta],
         },
         runtime_overrides={"PASTA": {"substrings": "instructions"}},
         gen_kwargs={"max_new_tokens": max_new_tokens, "do_sample": False},
@@ -727,8 +735,18 @@ def run_circuit_pasta_evaluation(
     print("\n[6/6] Results Summary")
     print("=" * 60)
     
+    # DEBUG: Print first 2 generations from each method to compare
+    print("\n[DEBUG] Comparing actual generations (first 100 chars):")
+    for method_name in ["baseline", "manual_pasta", "circuit_pasta", "boost_pasta"]:
+        gens = comparison_profiles[method_name][0]["generations"]
+        print(f"\n  {method_name}:")
+        for i in range(min(2, len(gens))):
+            response = gens[i]["response"][:100].replace('\n', ' ')
+            print(f"    Example {i}: {response}...")
+    print("\n" + "=" * 60)
+    
     results_table = []
-    for method_name in ["baseline", "manual_pasta", "circuit_pasta"]:
+    for method_name in ["baseline", "manual_pasta", "circuit_pasta", "boost_pasta"]:
         scores_dict = comparison_profiles[method_name][0]["evaluations"]["StrictInstruction"]
         results_table.append({
             "method": method_name,
